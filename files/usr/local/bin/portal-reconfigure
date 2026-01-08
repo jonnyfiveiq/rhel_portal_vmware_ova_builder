@@ -1,0 +1,7 @@
+#!/bin/bash
+echo "Reconfiguring Portal..."
+rm -f /etc/portal/.cloud-init-configured
+/usr/local/bin/portal-cloud-init.sh
+systemctl restart postgres.service portal.service 2>/dev/null || true
+sleep 5
+portal-status.sh

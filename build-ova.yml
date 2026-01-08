@@ -1,0 +1,150 @@
+---
+# build-ova.yml - Complete Portal OVA Builder
+# 
+# Prerequisites:
+#   1. podman login registry.redhat.io
+#   2. Place rhaap-portal-latest.tar.gz in this directory
+#
+# Usage:
+#   sudo -E ansible-playbook build-ova.yml
+#
+- name: Build Portal VMware OVA
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    base_image_tar: "rhaap-portal-latest.tar.gz"
+    base_image: "quay.io/audgirka/rhaap-portal-image:latest"
+    vmdk_image: "quay.io/acme_corp/portal-vmdk:latest"
+    output_dir: "./vmdk-output"
+    builder_image: "registry.redhat.io/rhel9/bootc-image-builder:latest"
+    bound_images:
+      - "registry.redhat.io/rhdh/rhdh-hub-rhel9:1.8"
+      - "registry.redhat.io/rhel9/postgresql-15:latest"
+
+  tasks:
+    # === PHASE 1: Load and prepare images ===
+    - name: Check for base image tarball
+      stat:
+        path: "{{ base_image_tar }}"
+      register: tar_stat
+
+    - name: Fail if base image tarball not found
+      fail:
+        msg: |
+          Base image '{{ base_image_tar }}' not found!
+          Please place the portal bootc image tarball in this directory.
+      when: not tar_stat.stat.exists
+
+    - name: Load portal base image from tarball
+      command: podman load -i {{ base_image_tar }}
+      register: load_result
+
+    - name: Display loaded image
+      debug:
+        msg: "{{ load_result.stdout }}"
+
+    - name: Pull bound images (container dependencies)
+      command: podman pull {{ item }}
+      loop: "{{ bound_images }}"
+      register: pull_result
+      retries: 3
+      delay: 5
+
+    # === PHASE 2: Build VMDK container image ===
+    - name: Build VMDK container image
+      command: podman build -t {{ vmdk_image }} .
+      register: build_container
+
+    - name: Display container build result
+      debug:
+        msg: "Container image built: {{ vmdk_image }}"
+
+    # === PHASE 3: Build QCOW2 with bootc-image-builder ===
+    - name: Create output directory
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Build QCOW2 image with bootc-image-builder
+      command: >
+        podman run --rm -it --privileged --pull=newer
+        --security-opt label=type:unconfined_t
+        -v {{ output_dir | realpath }}:/output
+        -v /var/lib/containers/storage:/var/lib/containers/storage
+        {{ builder_image }}
+        --type qcow2 --local {{ vmdk_image }}
+      environment:
+        REGISTRY_AUTH_FILE: "{{ lookup('env', 'REGISTRY_AUTH_FILE') | default('/run/user/' + lookup('env', 'SUDO_UID') + '/containers/auth.json', true) }}"
+
+    - name: Check for QCOW2 output
+      stat:
+        path: "{{ output_dir }}/qcow2/disk.qcow2"
+      register: qcow2_stat
+
+    - name: Fail if QCOW2 not created
+      fail:
+        msg: "QCOW2 image was not created. Check build output for errors."
+      when: not qcow2_stat.stat.exists
+
+    # === PHASE 4: Convert to VMDK ===
+    - name: Convert QCOW2 to VMDK (streamOptimized)
+      command: >
+        qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized
+        {{ output_dir }}/qcow2/disk.qcow2
+        {{ output_dir }}/portal-appliance.vmdk
+
+    - name: Get VMDK info
+      command: qemu-img info {{ output_dir }}/portal-appliance.vmdk
+      register: vmdk_info
+
+    - name: Display VMDK info
+      debug:
+        msg: "{{ vmdk_info.stdout_lines }}"
+
+    # === PHASE 5: Create OVA package ===
+    - name: Copy OVF template to output
+      copy:
+        src: templates/portal-appliance.ovf
+        dest: "{{ output_dir }}/portal-appliance.ovf"
+
+    - name: Generate SHA256 manifest
+      shell: |
+        cd {{ output_dir }}
+        sha256sum portal-appliance.ovf > portal-appliance.mf
+        sha256sum portal-appliance.vmdk >> portal-appliance.mf
+      args:
+        chdir: "{{ output_dir }}"
+
+    - name: Create OVA archive
+      command: tar -cvf portal-appliance.ova portal-appliance.ovf portal-appliance.mf portal-appliance.vmdk
+      args:
+        chdir: "{{ output_dir }}"
+
+    - name: Get OVA file info
+      stat:
+        path: "{{ output_dir }}/portal-appliance.ova"
+      register: ova_stat
+
+    # === FINAL: Report success ===
+    - name: Build complete
+      debug:
+        msg: |
+          
+          ========================================
+          OVA BUILD COMPLETE!
+          ========================================
+          
+          Output: {{ output_dir }}/portal-appliance.ova
+          Size: {{ (ova_stat.stat.size / 1073741824) | round(2) }} GB
+          
+          Deploy to vSphere/ESXi and configure OVF properties:
+            - AAP Host URL
+            - AAP API Token  
+            - OAuth Client ID
+            - OAuth Client Secret
+          
+          Default credentials: root / PortalAdmin123!
+          Portal URL: https://<VM-IP>:7007
+          ========================================

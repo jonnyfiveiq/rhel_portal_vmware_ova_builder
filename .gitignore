@@ -1,0 +1,9 @@
+vmdk-output/
+*.vmdk
+*.ova
+*.qcow2
+*.mf
+rhaap-portal-latest.tar.gz
+ansible-portal_installer-*.tar.gz
+.DS_Store
+*.log
